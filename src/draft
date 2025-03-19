@@ -1,0 +1,122 @@
+#draft no
+/**
+*Initialization: Each process initializes its portion of the 3D grid (local_T) with the initial temperature (water-cooling temperature).
+*Halo Exchange: Processes exchange boundary data with neighboring processes using MPI_Isend and MPI_Irecv to ensure boundary values are available.
+*Interior Calculation: Each process updates the temperature of the interior cells independently, as they don't rely on boundary data.
+*Boundary Calculation: After receiving the halo data, boundary cells are updated using the data from neighboring processes.
+*Global Reduction: MPI_Allreduce is used to calculate the global maximum temperature (T_max) and epsilon (temperature differences) to check for convergence across all processes.
+*Convergence Check: The simulation continues until convergence (based on epsilon) is reached, indicating that temperature changes are small enough.
+*/
+
+int main(int argc, char *argv[]) {
+    MPI_Init(&argc, &argv);
+
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    int blocks[3] = {4, 4, 4};   // Example block partitioning in x, y, z
+    int cube_index_x = rank % blocks[0];
+    int cube_index_y = (rank / blocks[0]) % blocks[1];
+    int cube_index_z = rank / (blocks[0] * blocks[1]);
+
+    int cube_size_x = 10, cube_size_y = 10, cube_size_z = 10;  // Example local cube sizes
+    double local_T[cube_size_x + 2][cube_size_y + 2][cube_size_z + 2];
+    double local_R[cube_size_x + 2][cube_size_y + 2][cube_size_z + 2];
+
+    // Allocate memory and initialize local_T
+    if (local_T == NULL || local_R == NULL) {
+        perror("T or R could not be allocated");
+        exit(1);
+    }
+
+    // Initialise local_T with watercooling temperature + 273.15
+    for (int x = 1; x < cube_size_x + 1; x++) {
+        for (int y = 1; y < cube_size_y + 1; y++) {
+            for (int z = 1; z < cube_size_z + 1; z++) {
+                local_T[x][y][z] = watercooling_T + 273.15;
+            }
+        }
+    }
+
+    double t_max = 0.0;
+    double epsilon = 0.0;
+    int convergence = 0;
+
+    MPI_Request requests[12];  // 6 sends and 6 receives
+    while (!convergence) {
+        int req_count = 0;
+
+        // Halo exchange with neighbors
+        if (cube_index_x != 0) {
+            MPI_Isend(&local_T[1][0][0], cube_size_y * cube_size_z, MPI_DOUBLE, rank - 1, 0, MPI_COMM_WORLD, &requests[req_count++]);
+            MPI_Irecv(&local_T[0][0][0], cube_size_y * cube_size_z, MPI_DOUBLE, rank - 1, 0, MPI_COMM_WORLD, &requests[req_count++]);
+        }
+        if (cube_index_x != blocks[0] - 1) {
+            MPI_Isend(&local_T[cube_size_x][0][0], cube_size_y * cube_size_z, MPI_DOUBLE, rank + 1, 0, MPI_COMM_WORLD, &requests[req_count++]);
+            MPI_Irecv(&local_T[cube_size_x + 1][0][0], cube_size_y * cube_size_z, MPI_DOUBLE, rank + 1, 0, MPI_COMM_WORLD, &requests[req_count++]);
+        }
+        if (cube_index_y != 0) {
+            MPI_Isend(&local_T[0][1][0], cube_size_x * cube_size_z, MPI_DOUBLE, rank - blocks[0], 0, MPI_COMM_WORLD, &requests[req_count++]);
+            MPI_Irecv(&local_T[0][0][0], cube_size_x * cube_size_z, MPI_DOUBLE, rank - blocks[0], 0, MPI_COMM_WORLD, &requests[req_count++]);
+        }
+        if (cube_index_y != blocks[1] - 1) {
+            MPI_Isend(&local_T[0][cube_size_y][0], cube_size_x * cube_size_z, MPI_DOUBLE, rank + blocks[0], 0, MPI_COMM_WORLD, &requests[req_count++]);
+            MPI_Irecv(&local_T[0][cube_size_y + 1][0], cube_size_x * cube_size_z, MPI_DOUBLE, rank + blocks[0], 0, MPI_COMM_WORLD, &requests[req_count++]);
+        }
+        if (cube_index_z != 0) {
+            MPI_Isend(&local_T[0][0][1], cube_size_x * cube_size_y, MPI_DOUBLE, rank - blocks[0] * blocks[1], 0, MPI_COMM_WORLD, &requests[req_count++]);
+            MPI_Irecv(&local_T[0][0][0], cube_size_x * cube_size_y, MPI_DOUBLE, rank - blocks[0] * blocks[1], 0, MPI_COMM_WORLD, &requests[req_count++]);
+        }
+        if (cube_index_z != blocks[2] - 1) {
+            MPI_Isend(&local_T[0][0][cube_size_z], cube_size_x * cube_size_y, MPI_DOUBLE, rank + blocks[0] * blocks[1], 0, MPI_COMM_WORLD, &requests[req_count++]);
+            MPI_Irecv(&local_T[0][0][cube_size_z + 1], cube_size_x * cube_size_y, MPI_DOUBLE, rank + blocks[0] * blocks[1], 0, MPI_COMM_WORLD, &requests[req_count++]);
+        }
+
+        // Calculate the interior points
+        for (int x = 1; x < cube_size_x - 1; x++) {
+            for (int y = 1; y < cube_size_y - 1; y++) {
+                for (int z = 1; z < cube_size_z - 1; z++) {
+                    local_R[x][y][z] = calc(local_T[x+1][y+1][z+1]);  // Replace with actual calc function
+                }
+            }
+        }
+
+        // Wait for all halo exchanges to complete
+        MPI_Waitall(req_count, requests, MPI_STATUSES_IGNORE);
+
+        // Calculate the boundary points
+        for (int y = 0; y < cube_size_y; y++) {
+            for (int z = 0; z < cube_size_z; z++) {
+                local_R[0][y][z] = calc(local_T[1][y+1][z+1]);
+                local_R[cube_size_x - 1][y][z] = calc(local_T[cube_size_x][y+1][z+1]);
+            }
+        }
+        for (int x = 1; x < cube_size_x - 1; x++) {
+            for (int z = 0; z < cube_size_z; z++) {
+                local_R[x][0][z] = calc(local_T[x+1][1][z+1]);
+                local_R[x][cube_size_y - 1][z] = calc(local_T[x+1][cube_size_y][z+1]);
+            }
+        }
+        for (int x = 1; x < cube_size_x - 1; x++) {
+            for (int y = 1; y < cube_size_y - 1; y++) {
+                local_R[x][y][0] = calc(local_T[x+1][y+1][1]);
+                local_R[x][y][cube_size_z - 1] = calc(local_T[x+1][y+1][cube_size_z]);
+            }
+        }
+
+        // Reduce the maximum temperature across all processes
+        double local_T_max = 0.0;  // Calculate local max temperature
+        MPI_Allreduce(&local_T_max, &t_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+
+        // Calculate epsilon (global temperature difference)
+        double local_epsilon = 0.0;  // Sum of temperature differences locally
+        MPI_Allreduce(&local_epsilon, &epsilon, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+
+        // Convergence check
+        convergence = (sqrt(epsilon) / dt) < 0.1;
+    }
+
+    MPI_Finalize();
+    return 0;
+}
